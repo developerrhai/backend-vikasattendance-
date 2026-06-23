@@ -15,7 +15,6 @@ const {
   buildAttendanceRecords,
   computeSummary,
 } = require("../services/smartoffice");
-const { sendWhatsAppMessage } = require("../services/whatsappService");
 
 const router = express.Router();
 
@@ -405,7 +404,10 @@ router.post("/notify-whatsapp", async (req, res) => {
 
 
 router.post("/notify-whatsapp", async (req, res) => {
-  const { date, records } = req.body;
+  const axios = require("axios");
+  const FormData = require("form-data");
+
+  const { date } = req.body;
 
   if (!date) {
     return res.status(400).json({
@@ -415,76 +417,16 @@ router.post("/notify-whatsapp", async (req, res) => {
   }
 
   try {
-    // Determine records to process: use req.body.records if present, otherwise fetch from database
-    let recordsToNotify = [];
-    if (records && Array.isArray(records)) {
-      recordsToNotify = records;
-    } else {
-      const result = await getAttendanceForDate(date);
-      recordsToNotify = result.records || [];
-    }
+    const result = await getAttendanceForDate(date);
 
-    // Filter out records without valid phone numbers or names
-    const validRecords = recordsToNotify.filter(record => {
-      const phone = (record.student?.parentMobile || record.student?.contact || record.student?.mobile || "").toString().trim();
-      return !!phone;
-    });
+    const absentStudents = result.records.filter(
+      (r) => r.status === "Absent"
+    );
 
-    // Send immediate response to frontend to prevent Gateway Timeout (HTTP 504)
-    res.json({
-      success: true,
-      message: `WhatsApp notification sending started in background for ${validRecords.length} student(s).`,
-      date,
-      summary: {
-        total: recordsToNotify.length,
-        toNotify: validRecords.length,
-        skipped: recordsToNotify.length - validRecords.length,
-      },
-    });
+    const lateStudents = result.records.filter(
+      (r) => r.status === "Late"
+    );
 
-    // Process notification sending asynchronously in the background
-    (async () => {
-      let sent = 0;
-      let failed = 0;
-
-      console.log(`[WhatsApp Bulk] Starting notification queue for ${validRecords.length} students on ${date}...`);
-
-      for (const record of validRecords) {
-        const studentName = record.student?.name || "Student";
-        const status = record.status || "Present";
-        const phone = (record.student?.parentMobile || record.student?.contact || record.student?.mobile || "").toString().trim();
-
-        try {
-          await sendWhatsAppMessage(phone, studentName, status, date);
-          sent++;
-          console.log(`[WhatsApp Bulk] ✅ Sent to ${studentName} (${phone}) - Status: ${status}`);
-        } catch (err) {
-          failed++;
-          console.error(`[WhatsApp Bulk] ❌ Failed to send to ${studentName} (${phone}):`, err.message);
-        }
-
-        // Wait 1500ms between sends to avoid rate-limiting
-        await new Promise((resolve) => setTimeout(resolve, 1500));
-      }
-
-      console.log(`[WhatsApp Bulk] Finished. Sent: ${sent}, Failed: ${failed}, Skipped: ${recordsToNotify.length - validRecords.length}`);
-    })().catch((err) => {
-      console.error("[WhatsApp Bulk] Error in background worker loop:", err);
-    });
-
-  } catch (err) {
-    console.error("[WhatsApp Bulk Route Error]", err);
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
-  }
-});
-
-    /*
-    // =========================================================================
-    // ORIGINAL SYNCHRONOUS CODE (Keep for reference - commented out to prevent timeout)
-    // =========================================================================
     let sent = 0;
     let failed = 0;
     const logs = [];
@@ -606,7 +548,6 @@ router.post("/notify-whatsapp", async (req, res) => {
       },
       logs,
     });
-    */
   } catch (err) {
     console.error("[WhatsApp ERROR]", err);
 
