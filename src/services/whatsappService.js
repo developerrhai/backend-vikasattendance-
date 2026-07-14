@@ -1,11 +1,14 @@
 const axios = require("axios");
 
-// Retrieve variables from environment or use defaults matching the frontend
-const WHATSASSURE_URL =
-  process.env.WHATSASSURE_API_URL ||
-  "https://crmapi.whatsassure.com//api/meta/v19.0/1167639093088437/messages";
+const FormData = require("form-data");
 
-const WHATSASSURE_TOKEN = process.env.WHATSASSURE_TOKEN || "";
+// Retrieve variables from environment or use defaults matching the frontend
+const WHATSAPP_API_URL =
+  process.env.WHATSAPP_API_URL ||
+  "https://api.rhaitech.online/api/create-message";
+
+const WABA_APPKEY = process.env.WABA_APPKEY || "63b954ad-a264-4f1a-bc06-738f3f8e0ea5";
+const WABA_AUTHKEY = process.env.WABA_AUTHKEY || "Ly1rcczQU9gILsKa4qW8vvTIAQ63BEmNH4g64HJyi7xsziQR4J";
 const TEMPLATE_NAME = process.env.WHATSASSURE_TEMPLATE_NAME || "present";
 const TEMPLATE_LANGUAGE = process.env.WHATSASSURE_TEMPLATE_LANGUAGE || "en";
 
@@ -69,11 +72,6 @@ function formatStatusText(status) {
  * @param {string} dateStr 
  */
 async function sendWhatsAppMessage(phone, studentName, status, dateStr) {
-  const token = (WHATSASSURE_TOKEN || "").trim();
-  if (!token) {
-    throw new Error("WHATSASSURE_TOKEN environment variable is not set.");
-  }
-
   const normalizedPhone = normalizePhone(phone);
   if (!normalizedPhone) {
     throw new Error(`Invalid phone number format: "${phone}"`);
@@ -82,31 +80,18 @@ async function sendWhatsAppMessage(phone, studentName, status, dateStr) {
   const formattedDate = formatDate(dateStr);
   const statusText = formatStatusText(status);
 
-  const payload = {
-    messaging_product: "whatsapp",
-    to: normalizedPhone,
-    type: "template",
-    template: {
-      name: TEMPLATE_NAME.trim(),
-      language: { code: TEMPLATE_LANGUAGE.trim() },
-      components: [
-        {
-          type: "body",
-          parameters: [
-            { type: "text", text: studentName },        // {{1}}
-            { type: "text", text: statusText },          // {{2}}
-            { type: "text", text: formattedDate },       // {{3}}
-          ],
-        },
-      ],
-    },
-  };
+  const form = new FormData();
+  form.append("appkey", WABA_APPKEY.trim());
+  form.append("authkey", WABA_AUTHKEY.trim());
+  form.append("to", normalizedPhone);
+  form.append("template_id", TEMPLATE_NAME.trim());
+  form.append("language", TEMPLATE_LANGUAGE.trim());
+  form.append("variables[{1}]", studentName);
+  form.append("variables[{2}]", statusText);
+  form.append("variables[{3}]", formattedDate);
 
-  const response = await axios.post(WHATSASSURE_URL, payload, {
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
+  const response = await axios.post(WHATSAPP_API_URL, form, {
+    headers: form.getHeaders(),
     timeout: 30000,
   });
 

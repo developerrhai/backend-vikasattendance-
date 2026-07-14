@@ -8,6 +8,7 @@ const { initDb } = require("./config/db");
 const attendanceRouter = require("./routes/attendance");
 const studentsRouter   = require("./routes/students");
 const biometricRouter  = require("./routes/biometric");
+const batchesRouter    = require("./routes/batches");
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
@@ -49,6 +50,7 @@ app.get("/api/health", (_req, res) => {
 app.use("/api/attendance", attendanceRouter);
 app.use("/api/students",   studentsRouter);
 app.use("/api/biometric",  biometricRouter);
+app.use("/api/batches",    batchesRouter);
 
 // ─── START SERVER ─────────────────────────────────────────
 /* app.listen(PORT, () => {

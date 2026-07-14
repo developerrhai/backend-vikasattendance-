@@ -1,16 +1,17 @@
 const axios = require("axios");
-const sendWhatsApp = require("./sendWhatsApp"); // ✅ FIX 1: Missing import
-const { query } = require("../config/db"); // ✅ Import DB query to lookup contact info
+const sendWhatsApp = require("./sendWhatsApp");
+const sendSMS = require("./sendSMS");
+const { query } = require("../config/db");
+const { timeToMinutes } = require("../services/smartoffice");
 
 const SMARTOFFICE_BASE   = process.env.SMARTOFFICE_BASE_URL      || "http://13.232.199.167";
 const API_KEY            = process.env.SMARTOFFICE_API_KEY       || "385619062612";
 const DEFAULT_SERIAL     = process.env.SMARTOFFICE_SERIAL_NUMBER || "AMDB25121401560";
 
 let lastLogTime = null; // store last processed punch
+let isFirstRun = true;  // skip sending notifications on startup for historical logs today
+let isProcessing = false; // lock to prevent overlapping runs
 
-/**
- * Returns today's date formatted as YYYY-MM-DD.
- */
 function todayDate() {
   const d = new Date();
   const yyyy = d.getFullYear();
@@ -20,10 +21,15 @@ function todayDate() {
 }
 
 async function checkNewPunches() {
+  if (isProcessing) {
+    console.log("[Watcher] Already processing a batch, skipping this run...");
+    return;
+  }
+
   try {
+    isProcessing = true;
     const today = todayDate();
 
-    // ✅ FIX 2: Include required query params (FromDate, ToDate, SerialNumber)
     const url =
       `${SMARTOFFICE_BASE}/api/v2/WebAPI/GetDeviceLogs` +
       `?APIKey=${API_KEY}` +
@@ -33,8 +39,24 @@ async function checkNewPunches() {
 
     const res = await axios.get(url, { timeout: 15000 });
 
-    // SmartOffice returns an array directly when successful
-    const logs = Array.isArray(res.data) ? res.data : (res.data?.data || []);
+    const rawLogs = Array.isArray(res.data) ? res.data : (res.data?.data || []);
+
+    const logs = rawLogs.filter((log) => log.LogDate || log.DateTime).sort((a, b) => {
+      const dateA = new Date((a.LogDate || a.DateTime).replace(" ", "T"));
+      const dateB = new Date((b.LogDate || b.DateTime).replace(" ", "T"));
+      return dateA - dateB;
+    });
+
+    if (isFirstRun) {
+      isFirstRun = false;
+      if (logs.length > 0) {
+        lastLogTime = logs[logs.length - 1].LogDate || logs[logs.length - 1].DateTime;
+        console.log(`[Watcher] Initialized lastLogTime on startup to: ${lastLogTime}`);
+      } else {
+        console.log("[Watcher] No logs found today yet. Initialized lastLogTime to null");
+      }
+      return;
+    }
 
     for (const log of logs) {
       const logTime = log.LogDate || log.DateTime;
@@ -44,10 +66,8 @@ async function checkNewPunches() {
         continue;
       }
 
-      // update last processed time
       lastLogTime = logTime;
 
-      // Lookup student contact details in database
       try {
         const studentCode = String(log.EmployeeCode).trim();
         const students = await query(
@@ -57,7 +77,6 @@ async function checkNewPunches() {
 
         if (students && students.length > 0) {
           const student = students[0];
-          // Populate the log object with name and contact details for sendWhatsApp
           log.EmployeeName = student.name;
           log.Mobile = student.parent_mobile || student.contact;
 
@@ -77,8 +96,49 @@ async function checkNewPunches() {
           // Even index (0, 2, 4...) -> Entry (0), Odd index (1, 3, 5...) -> Exit (1)
           log.InOutMode = (punchIndex !== -1 && punchIndex % 2 === 0) ? 0 : 1;
 
-          // trigger WhatsApp notification
-          await sendWhatsApp(log);
+          // Look up mapped batches for student
+          const assignedBatches = await query(
+            `SELECT b.* FROM batches b JOIN student_batches sb ON b.id = sb.batch_id WHERE sb.student_code = ?`,
+            [studentCode]
+          );
+
+          const logTimeOnly = logTime.split(" ")[1];
+          const pMin = timeToMinutes(logTimeOnly);
+
+          let matchedBatch = null;
+          for (const b of assignedBatches) {
+            const sMin = timeToMinutes(b.start_time);
+            const eMin = timeToMinutes(b.end_time);
+            if (pMin >= sMin - 30 && pMin <= eMin + 30) {
+              matchedBatch = b;
+              break;
+            }
+          }
+
+          if (log.InOutMode === 0) {
+            if (matchedBatch) {
+              const sMin = timeToMinutes(matchedBatch.start_time);
+              const grace = matchedBatch.late_grace_minutes ?? 10;
+              const isLate = pMin > sMin + grace;
+              log.CustomStatus = isLate 
+                ? `Late in ${matchedBatch.name}` 
+                : `Present in ${matchedBatch.name}`;
+            } else {
+              log.CustomStatus = "Present (General)";
+            }
+          } else {
+            if (matchedBatch) {
+              log.CustomStatus = `Exited from ${matchedBatch.name}`;
+            } else {
+              log.CustomStatus = "Exited";
+            }
+          }
+
+          // trigger WhatsApp notification (Disabled in favor of SMS)
+          // await sendWhatsApp(log);
+
+          // trigger SMS notification
+          await sendSMS(log);
         } else {
           console.log(`[Watcher] Student not found in database for code: ${studentCode}`);
         }
@@ -86,15 +146,16 @@ async function checkNewPunches() {
         console.error(`[Watcher] DB Lookup Error for code ${log.EmployeeCode}:`, dbErr.message);
       }
 
-      // ✅ FIX 3: Small delay between WhatsApp sends to avoid rate-limiting
-      await new Promise((r) => setTimeout(r, 1000));
+      await new Promise((r) => setTimeout(r, 100)); // Delay between bulk SMS sends
     }
   } catch (err) {
     console.log("[Watcher] Error:", err.message);
+  } finally {
+    isProcessing = false;
   }
 }
 
-// Run every 30 seconds (increased from 15s to reduce load)
+// Run every 30 seconds
 setInterval(checkNewPunches, 30000);
 
 // Run once on startup after a short delay

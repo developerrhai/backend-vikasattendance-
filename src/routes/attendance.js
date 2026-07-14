@@ -16,6 +16,7 @@ const {
   computeSummary,
 } = require("../services/smartoffice");
 const { sendWhatsAppMessage } = require("../services/whatsappService");
+const sendSMS = require("./sendSMS"); // ✅ Import SMS service
 
 const router = express.Router();
 
@@ -36,24 +37,48 @@ async function getAttendanceForDate(date) {
     console.warn(`[Attendance] SmartOffice error (proceeding with DB data): ${err.message}`);
   }
 
-  // 3. Load leave set for this date
+  // 3. Load student batches assignments
+  const mappings = await query(
+    `SELECT sb.student_code, sb.batch_id, b.name, b.start_time, b.end_time, b.late_grace_minutes 
+     FROM student_batches sb
+     JOIN batches b ON sb.batch_id = b.id`
+  );
+  
+  const studentBatchesMap = new Map();
+  for (const m of mappings) {
+    const code = String(m.student_code).trim();
+    if (!studentBatchesMap.has(code)) studentBatchesMap.set(code, []);
+    studentBatchesMap.get(code).push({
+      id: m.batch_id,
+      name: m.name,
+      start_time: m.start_time,
+      end_time: m.end_time,
+      late_grace_minutes: m.late_grace_minutes,
+    });
+  }
+
+  // 4. Load leave set for this date
   const leaveRows = await query(
-    "SELECT student_code FROM leaves WHERE date = ?",
+    "SELECT student_code, batch_id FROM leaves WHERE date = ?",
     [date]
   );
-  const leaveSet = new Set(leaveRows.map((r) => String(r.student_code).trim()));
+  // Store as student_code:batch_id strings. Whole-day leaves will have batch_id = null
+  const leaveSet = new Set(
+    leaveRows.map((r) => `${String(r.student_code).trim()}:${r.batch_id || "null"}`)
+  );
 
-  // 4. Load override map for this date
+  // 5. Load override map for this date
   const overrideRows = await query(
     "SELECT * FROM attendance_overrides WHERE date = ?",
     [date]
   );
+  // Store mapped by student_code:batch_id
   const overrideMap = new Map(
-    overrideRows.map((r) => [String(r.student_code).trim(), r])
+    overrideRows.map((r) => [`${String(r.student_code).trim()}:${r.batch_id || "null"}`, r])
   );
 
-  // 5. Build enriched records
-  const records = buildAttendanceRecords(students, logs, date, leaveSet, overrideMap);
+  // 6. Build enriched records
+  const records = buildAttendanceRecords(students, logs, date, leaveSet, overrideMap, studentBatchesMap);
   const summary = computeSummary(records);
 
   return {
@@ -119,7 +144,7 @@ router.post("/sync", async (req, res) => {
 
 // ── POST /api/attendance/leave ────────────────────────────────────────────────
 router.post("/leave", async (req, res) => {
-  const { studentCode, date } = req.body;
+  const { studentCode, date, batchId } = req.body;
 
   if (!studentCode || !date) {
     return res.status(400).json({
@@ -143,15 +168,15 @@ router.post("/leave", async (req, res) => {
 
     // Upsert leave record
     await query(
-      `INSERT INTO leaves (student_code, date)
-       VALUES (?, ?)
+      `INSERT INTO leaves (student_code, date, batch_id)
+       VALUES (?, ?, ?)
        ON DUPLICATE KEY UPDATE created_at = created_at`,
-      [studentCode, date]
+      [studentCode, date, batchId || null]
     );
 
     return res.json({
       success: true,
-      message: `Leave marked for student ${studentCode} on ${date}`,
+      message: `Leave marked for student ${studentCode} on ${date} (Batch ID: ${batchId || 'all'})`,
     });
   } catch (err) {
     console.error("[Attendance] POST /leave", err.message);
@@ -161,7 +186,7 @@ router.post("/leave", async (req, res) => {
 
 // ── PUT /api/attendance/record ────────────────────────────────────────────────
 router.put("/record", async (req, res) => {
-  const { studentCode, date, status, punchIn, punchOut } = req.body;
+  const { studentCode, date, status, punchIn, punchOut, batchId } = req.body;
 
   if (!studentCode || !date) {
     return res.status(400).json({
@@ -181,19 +206,19 @@ router.put("/record", async (req, res) => {
   try {
     // Upsert override
     await query(
-      `INSERT INTO attendance_overrides (student_code, date, status, punch_in, punch_out, manually_edited)
-       VALUES (?, ?, ?, ?, ?, 1)
+      `INSERT INTO attendance_overrides (student_code, date, status, punch_in, punch_out, batch_id, manually_edited)
+       VALUES (?, ?, ?, ?, ?, ?, 1)
        ON DUPLICATE KEY UPDATE
          status          = COALESCE(VALUES(status),    status),
          punch_in        = COALESCE(VALUES(punch_in),  punch_in),
          punch_out       = COALESCE(VALUES(punch_out), punch_out),
          manually_edited = 1`,
-      [studentCode, date, status || null, punchIn || null, punchOut || null]
+      [studentCode, date, status || null, punchIn || null, punchOut || null, batchId || null]
     );
 
     return res.json({
       success: true,
-      message: `Attendance record updated for ${studentCode} on ${date}`,
+      message: `Attendance record updated for ${studentCode} on ${date} (Batch ID: ${batchId || 'all'})`,
     });
   } catch (err) {
     console.error("[Attendance] PUT /record", err.message);
@@ -454,10 +479,15 @@ router.post("/notify-whatsapp", async (req, res) => {
         const status = record.status || "Present";
         const phone = (record.student?.parentMobile || record.student?.contact || record.student?.mobile || "").toString().trim();
 
+        // Format status to include batch info for clear context
+        const statusWithBatch = (status === "Present" || status === "Late")
+          ? `${status} in ${record.batch?.name || "General Batch"}`
+          : `${status} from ${record.batch?.name || "General Batch"}`;
+
         try {
-          await sendWhatsAppMessage(phone, studentName, status, date);
+          await sendWhatsAppMessage(phone, studentName, statusWithBatch, date);
           sent++;
-          console.log(`[WhatsApp Bulk] ✅ Sent to ${studentName} (${phone}) - Status: ${status}`);
+          console.log(`[WhatsApp Bulk] ✅ Sent to ${studentName} (${phone}) - Status: ${statusWithBatch}`);
         } catch (err) {
           failed++;
           console.error(`[WhatsApp Bulk] ❌ Failed to send to ${studentName} (${phone}):`, err.message);
@@ -474,6 +504,89 @@ router.post("/notify-whatsapp", async (req, res) => {
 
   } catch (err) {
     console.error("[WhatsApp Bulk Route Error]", err);
+    return res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  }
+});
+
+// ── POST /api/attendance/notify-sms ───────────────────────────────────────────
+router.post("/notify-sms", async (req, res) => {
+  const { date, records } = req.body;
+
+  if (!date) {
+    return res.status(400).json({
+      success: false,
+      error: "date is required",
+    });
+  }
+
+  try {
+    let recordsToNotify = [];
+    if (records && Array.isArray(records)) {
+      recordsToNotify = records;
+    } else {
+      const result = await getAttendanceForDate(date);
+      recordsToNotify = result.records || [];
+    }
+
+    const validRecords = recordsToNotify.filter(record => {
+      const phone = (record.student?.parentMobile || record.student?.contact || record.student?.mobile || "").toString().trim();
+      // SMS API currently only has templates for Entry (Present) and Exit (Exited)
+      return !!phone && (record.status === "Present" || record.status === "Exited");
+    });
+
+    res.json({
+      success: true,
+      message: `SMS notification sending started in background for ${validRecords.length} present/exited student(s).`,
+      date,
+      summary: {
+        total: recordsToNotify.length,
+        toNotify: validRecords.length,
+        skipped: recordsToNotify.length - validRecords.length,
+      },
+    });
+
+    (async () => {
+      let sent = 0;
+      let failed = 0;
+
+      console.log(`[SMS Bulk] Starting notification queue for ${validRecords.length} students on ${date}...`);
+
+      for (const record of validRecords) {
+        const studentName = record.student?.name || "Student";
+        const status = record.status || "Present";
+        const phone = (record.student?.parentMobile || record.student?.contact || record.student?.mobile || "").toString().trim();
+        
+        // Map to SmartOffice log structure expected by sendSMS
+        const log = {
+          EmployeeName: studentName,
+          Mobile: phone,
+          LogDate: record.punchOut || record.punchIn || new Date().toISOString(),
+          InOutMode: (status === "Exited" || record.punchOut) ? 1 : 0
+        };
+
+        try {
+          await sendSMS(log);
+          sent++;
+          console.log(`[SMS Bulk] ✅ Sent to ${studentName} (${phone})`);
+        } catch (err) {
+          failed++;
+          console.error(`[SMS Bulk] ❌ Failed to send to ${studentName} (${phone}):`, err.message);
+        }
+
+        // Wait 100ms between SMS requests to avoid hitting rate limits too fast
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+
+      console.log(`[SMS Bulk] Finished. Sent: ${sent}, Failed: ${failed}, Skipped: ${recordsToNotify.length - validRecords.length}`);
+    })().catch((err) => {
+      console.error("[SMS Bulk] Error in background worker loop:", err);
+    });
+
+  } catch (err) {
+    console.error("[SMS Bulk Route Error]", err);
     return res.status(500).json({
       success: false,
       error: err.message,
