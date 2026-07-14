@@ -133,6 +133,21 @@ async function initDb() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
 
+    // ── Fees records ───────────────────────────────────────────────────────
+    await conn.execute(`
+      CREATE TABLE IF NOT EXISTS fees (
+        id             INT AUTO_INCREMENT PRIMARY KEY,
+        student_code   VARCHAR(50) NOT NULL,
+        amount         DECIMAL(10,2) NOT NULL,
+        payment_date   DATE NOT NULL,
+        payment_method VARCHAR(50) DEFAULT 'Cash',
+        remarks        VARCHAR(255) DEFAULT '',
+        created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FOREIGN KEY (student_code) REFERENCES students(code) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+
     // ── Migrations for attendance_overrides ──────────────────────────────
     const [overrideCols] = await conn.execute(`
       SELECT COLUMN_NAME
